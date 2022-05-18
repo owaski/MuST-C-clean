@@ -2,6 +2,7 @@ import os
 import re
 import csv
 import argparse
+import logging
 from dataclasses import dataclass
 
 import torch
@@ -11,18 +12,12 @@ import editdistance
 import spacy
 from tqdm import tqdm
 from num2words import num2words
+import yaml
 
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
-def load_df_from_tsv(path: str):
-    return pd.read_csv(
-        path,
-        sep="\t",
-        header=0,
-        encoding="utf-8",
-        escapechar="\\",
-        quoting=csv.QUOTE_NONE,
-        na_filter=False,
-    )
+SAMPLE_RATE = 16000
 
 def save_df_to_tsv(dataframe, path):
     dataframe.to_csv(
@@ -215,42 +210,86 @@ class GreedyCTCDecoder(torch.nn.Module):
         indices = [i for i in indices if i not in self.ignore]
         return ''.join([self.labels[i] for i in indices])
 
+def write_html(mismatch_df, tgt_lang, split):
+    string = '<table>\n'
+    string += '\t<tr>\n\t\t<th>Transcript</th>\n\t\t<th>Source Audio</th>\n\t</tr>\n'
+    for i in tqdm(range(mismatch_df.shape[0])):
+        audio_path = 'wav/{}.wav'.format(i)
+        string += '\t<tr>\n\t\t<td>{}</td>\n\t\t<td>{}</td>\n\t</tr>\n'.format(
+            mismatch_df['transcript'][i],
+            '<audio controls><source src="{}" type="audio/wav"></audio>'.format(audio_path)
+        )
+    string += '</table>'
+
+    with open('results/{}/{}/mismatch.html'.format(tgt_lang, split), 'w') as w:
+        w.write(string)
 
 def main(args):
     device = torch.device(args.device)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+    tgt_lang = args.tgt_lang
+    split = args.split
+    
+    os.makedirs('results/{}/{}/wav'.format(tgt_lang, split), exist_ok=True)
+
+    logging.info('Loading wav2vec-2.0-large ASR fine-tuned model')
     bundle = torchaudio.pipelines.WAV2VEC2_ASR_LARGE_LV60K_960H
     model = bundle.get_model().to(device)
     labels = bundle.get_labels()
     dictionary = {c: i for i, c in enumerate(labels)}
 
     mustc_root = args.mustc_root
-    df = load_df_from_tsv(args.tsv_path)
+    split_root = os.path.join(mustc_root, 'en-{}'.format(args.tgt_lang), 'data', split)
+
+    logging.info('Loading transcripts and yaml file')
+
+    transcripts = []
+    with open(os.path.join(split_root, 'txt/{}.en'.format(args.split)), 'r') as r:
+        transcripts = [line.strip() for line in r.readlines() if line.strip() != '']
+    
+    with open(os.path.join(split_root, 'txt/{}.yaml'.format(args.split)), 'r') as r:
+        segs = yaml.load(r, yaml.CLoader)
+
+    for seg, t in zip(segs, transcripts):
+        seg['transcript'] = t
 
     decoder = GreedyCTCDecoder(
         labels=bundle.get_labels(),
         ignore=(0, 1, 2, 3),
     )
     
-    mismatch_df = pd.DataFrame(columns=df.columns)
-    iterator = tqdm(df.iterrows(), total=df.shape[0], desc='0 mismatch found')
-    for _, row in iterator:
+    logging.info('Detecting mismatch')
+
+    mismatch_df = pd.DataFrame(columns=['duration', 'offset', 'speaker_id', 'wav', 'transcript'])
+    iterator = tqdm(segs, desc='0 mismatch found')
+    finished = True
+    tot = 40
+    for seg in iterator:
         try:
-            splits = row['audio'].split(':')
-            ori_start, ori_duration = splits[-2:]
-            ori_start, ori_duration = int(ori_start), int(ori_duration)
+            tot -= 1
+            if tot == 0:
+                break
+            audio_path = os.path.join(split_root, 'wav/{}'.format(seg['wav']))
+            audio_info = torchaudio.info(audio_path)
+
+            if audio_info.sample_rate != SAMPLE_RATE:
+                print('The sample rate of wav file is not 16000.')
+                finished = False
+                break
+
+            ori_start, ori_duration = int(seg['offset'] * SAMPLE_RATE), int(seg['duration'] * SAMPLE_RATE)
             
             ext = 1
 
-            wav_file = os.path.join(mustc_root, ''.join(splits[:-2]))
             with torch.inference_mode():
-                waveform, _ = torchaudio.load(wav_file, \
-                    frame_offset=max(ori_start - int(ext * 16000), 0), num_frames=ori_duration + 2 * ext * 16000)
+                waveform, _ = torchaudio.load(audio_path, \
+                    frame_offset=max(ori_start - int(ext * SAMPLE_RATE), 0), num_frames=ori_duration + 2 * ext * SAMPLE_RATE)
                 emissions, _ = model(waveform.to(device))
                 emissions = torch.log_softmax(emissions, dim=-1)
             emission = emissions[0].cpu().detach()
 
-            transcript = clean(row['src_text'], dictionary)
+            transcript = clean(seg['transcript'], dictionary)
             if transcript == '':
                 continue
             tokens = [dictionary[c] for c in transcript]
@@ -264,32 +303,40 @@ def main(args):
             end = ratio * word_segments[-1].end
 
             ext_len = waveform.size(1)
-            flag = start < 0.85 * ext * 16000 or end > ext_len - 0.85 * ext * 16000
+            flag = start < 0.85 * ext * SAMPLE_RATE or end > ext_len - 0.85 * ext * SAMPLE_RATE
 
             if not flag:
                 with torch.inference_mode():
-                    waveform, _ = torchaudio.load(wav_file, frame_offset=ori_start, num_frames=ori_duration)
+                    waveform, _ = torchaudio.load(audio_path, frame_offset=ori_start, num_frames=ori_duration)
                     emissions, _ = model(waveform.to(device))
                     emissions = torch.log_softmax(emissions, dim=-1)
                 emission = emissions[0].cpu().detach()
                 asr_transcript = decoder(emission)
                 edit_distance = editdistance.eval(transcript, asr_transcript)
 
-                flag |= ext * 16000 < start and ext_len - ext * 16000 > end and \
-                    ((ext + 1) * 16000 < start or ext_len - (ext + 1) * 16000 > end) and edit_distance / len(transcript) > 0.3
+                flag |= ext * SAMPLE_RATE < start and ext_len - ext * SAMPLE_RATE > end and \
+                    ((ext + 1) * SAMPLE_RATE < start or ext_len - (ext + 1) * SAMPLE_RATE > end) and edit_distance / len(transcript) > 0.3
 
                 flag |= edit_distance / len(transcript) > 0.7
 
-                if flag:
-                    print(transcript, asr_transcript, sep='\n')
+                # if flag:
+                #     print(transcript, asr_transcript, sep='\n')
 
             if flag:
-                mismatch_df = mismatch_df.append(row, ignore_index=True)
+                mismatch_df = mismatch_df.append(seg, ignore_index=True)
                 iterator.set_description('{} mismatch found'.format(mismatch_df.shape[0]))
-        except Exception as e:
-            print(e)
+                
+                waveform, _ = torchaudio.load(audio_path, frame_offset=ori_start, num_frames=ori_duration)
+                torchaudio.save('results/{}/{}/wav/{}.wav'.format(tgt_lang, split, len(mismatch_df) - 1), waveform, sample_rate=16000)
 
-    save_df_to_tsv(mismatch_df, 'mismatch.tsv')
+        except Exception as e:
+            pass
+
+    if not finished:
+        return 
+    
+    save_df_to_tsv(mismatch_df, os.path.join('results/{}/{}/mismatch.tsv'.format(tgt_lang, split)))
+    write_html(mismatch_df, tgt_lang, split)
     
 
 def parse_args():
@@ -298,8 +345,10 @@ def parse_args():
         help='device to run detector')
     parser.add_argument('--mustc-root', type=str, required=True, \
         help='directory of must-c dataset')
-    parser.add_argument('--tsv-path', type=str, required=True, \
-        help='path to MuST-C tsv file path')
+    parser.add_argument('--tgt-lang', type=str, required=True, \
+        help='target translation language')
+    parser.add_argument('--split', type=str, default='train', \
+        help='which split to detect mismatch')
     args = parser.parse_args()
     return args
 
