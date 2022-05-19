@@ -28,4 +28,4 @@ python detect.py \
     --split {train/dev/tst-COMMON/tst-HE}
 ```
 
-The results will be saved in `results/{split}`
+The results will be saved in `results/{split}`. The tsv file `mismatch.tsv` contains the description of the detected audio-transcript mismatch cases. The html file `mismatch.html` allows you to listen to the speech and compare it with the given transcript.
