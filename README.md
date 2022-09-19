@@ -1,5 +1,5 @@
 # MuST-C-clean
-This is the repo for paper "On the Impact of Noises in Crowd-Sourced Data for Speech Translation" in IWSLT 2022. It is currently under development.
+This is the repo for paper "On the Impact of Noises in Crowd-Sourced Data for Speech Translation" in IWSLT 2022.
 
 This detector is adapted from code in https://pytorch.org/tutorials/intermediate/forced_alignment_with_torchaudio_tutorial.html#sphx-glr-intermediate-forced-alignment-with-torchaudio-tutorial-py.
 
